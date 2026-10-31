@@ -1,7 +1,10 @@
-name: Build dylib
+name: Build libFLEX
 on:
-  push:
   workflow_dispatch:
+  push:
+    paths:
+      - 'Loader.m'
+      - '.github/workflows/flex.yml'
 
 jobs:
   build:
@@ -9,26 +12,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install tools
-        run: brew install ldid
+      - name: Get FLEX
+        run: git clone --depth=1 https://github.com/FLEXTool/FLEX.git FLEX
 
-      - name: Install Theos
+      - name: Build libFLEX.dylib
         run: |
-          git clone --recursive https://github.com/theos/theos.git $HOME/theos
-          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          INC=$(find FLEX/Classes -type d | sed 's/^/-I/' | tr '\n' ' ')
+          export CF="-arch arm64 -isysroot $SDK -miphoneos-version-min=14.0 -fobjc-arc -fmodules -w -O1 $INC"
+          mkdir -p obj out
+          { find FLEX/Classes -type f \( -name '*.m' -o -name '*.mm' -o -name '*.c' \); echo Loader.m; } > files.txt
+          wc -l files.txt
+          cat files.txt | xargs -P 4 -I{} sh -c 'xcrun -sdk iphoneos clang $CF -c "{}" -o "obj/$(echo {} | tr / _).o"'
+          xcrun -sdk iphoneos clang -arch arm64 -isysroot $SDK -miphoneos-version-min=14.0 \
+            -dynamiclib obj/*.o -o out/libFLEX.dylib -install_name @rpath/libFLEX.dylib \
+            -framework Foundation -framework UIKit -framework CoreGraphics -framework ImageIO \
+            -framework QuartzCore -framework WebKit -framework Security -framework SceneKit \
+            -framework UniformTypeIdentifiers -framework Photos -framework AVFoundation \
+            -framework CoreData -framework MobileCoreServices -lsqlite3 -lz -lc++
+          ls -la out
 
-      - name: Install SDKs
+      - name: Sign
         run: |
-          git clone --depth=1 https://github.com/theos/sdks.git /tmp/sdks
-          cp -R /tmp/sdks/*.sdk $HOME/theos/sdks/
-
-      - name: Build
-        run: make FINALPACKAGE=1
-
-      - name: Show output
-        run: ls -la .theos/obj
+          brew install ldid
+          ldid -S out/libFLEX.dylib
 
       - uses: actions/upload-artifact@v4
         with:
-          name: YTDownload-dylib
-          path: .theos/obj/*.dylib
+          name: libFLEX-dylib
+          path: out/libFLEX.dylib
