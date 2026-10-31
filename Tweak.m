@@ -12,16 +12,78 @@ static UIAlertController *gProgress;
 
 #pragma mark - UI helpers
 
-static UIViewController *TopVC(void) {
-    UIWindow *w = nil;
+// Dedicated overlay window: hosts the button above everything and presents all alerts,
+// so YouTube's own view/gesture hierarchy can't swallow touches or block presentation.
+@interface YTDLWindow : UIWindow
+@end
+@implementation YTDLWindow
+- (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
+    UIView *v = [super hitTest:p withEvent:e];
+    if (self.rootViewController.presentedViewController) return v;
+    return (v == self || v == self.rootViewController.view) ? nil : v;
+}
+@end
+
+static YTDLWindow *gWin;
+static UIButton *gBtn;
+
+static UIWindowScene *ActiveScene(void) {
+    UIWindowScene *fallback = nil;
     for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
         if (![s isKindOfClass:UIWindowScene.class]) continue;
-        for (UIWindow *x in ((UIWindowScene *)s).windows) {
-            if (x.isKeyWindow) { w = x; break; }
-        }
-        if (w) break;
+        if (s.activationState == UISceneActivationStateForegroundActive) return (UIWindowScene *)s;
+        if (!fallback) fallback = (UIWindowScene *)s;
     }
-    UIViewController *v = w.rootViewController;
+    return fallback;
+}
+
+static void UpdateButton(void) {
+    UIViewController *vc = gPlayerVC;
+    UIView *pv = vc.viewIfLoaded;
+    BOOL show = pv && pv.window && !pv.hidden && pv.alpha > 0.01 && pv.bounds.size.width > 150;
+    gBtn.hidden = !show;
+    if (!show) return;
+    CGRect r = [pv convertRect:pv.bounds toView:nil];
+    CGRect wb = gWin.bounds;
+    CGFloat x = MAX(r.origin.x, 0) + 8;
+    CGFloat y = MAX(r.origin.y, 0) + 8;
+    if (wb.size.width > wb.size.height) { // landscape: keep clear of notch/status area
+        x += gWin.safeAreaInsets.left;
+        y += 8;
+    }
+    gBtn.frame = CGRectMake(x, y, 34, 34);
+}
+
+static void EnsureWindow(void) {
+    if (gWin) return;
+    UIWindowScene *sc = ActiveScene();
+    if (!sc) return;
+    gWin = [[YTDLWindow alloc] initWithWindowScene:sc];
+    gWin.windowLevel = UIWindowLevelAlert + 1;
+    gWin.backgroundColor = UIColor.clearColor;
+    UIViewController *root = [UIViewController new];
+    root.view.backgroundColor = UIColor.clearColor;
+    gWin.rootViewController = root;
+    gWin.hidden = NO;
+
+    gBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    gBtn.frame = CGRectMake(8, 8, 34, 34);
+    gBtn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
+    gBtn.layer.cornerRadius = 17;
+    gBtn.tintColor = UIColor.whiteColor;
+    gBtn.hidden = YES;
+    [gBtn setImage:[UIImage systemImageNamed:@"arrow.down.circle"] forState:UIControlStateNormal];
+    id target = [[NSClassFromString(@"YTDLTarget") alloc] init];
+    [gBtn addTarget:target action:NSSelectorFromString(@"tapped") forControlEvents:UIControlEventTouchUpInside];
+    objc_setAssociatedObject(gBtn, "ytdl_target", target, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [root.view addSubview:gBtn];
+
+    [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *t) { UpdateButton(); }];
+}
+
+static UIViewController *TopVC(void) {
+    EnsureWindow();
+    UIViewController *v = gWin.rootViewController;
     while (v.presentedViewController) v = v.presentedViewController;
     return v;
 }
@@ -270,11 +332,11 @@ static void ShowQualityPicker(NSArray *opts, NSString *vid) {
 #pragma mark - Button
 
 @interface YTDLTarget : NSObject
-+ (void)tapped;
+- (void)tapped;
 @end
 
 @implementation YTDLTarget
-+ (void)tapped {
+- (void)tapped {
     NSString *vid = nil;
     UIViewController *vc = gPlayerVC;
     SEL sel = NSSelectorFromString(@"currentVideoID");
@@ -302,16 +364,7 @@ static void (*origAppear)(id, SEL, BOOL);
 static void newAppear(UIViewController *self, SEL _cmd, BOOL animated) {
     origAppear(self, _cmd, animated);
     gPlayerVC = self;
-    if ([self.view viewWithTag:9911]) return;
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-    b.tag = 9911;
-    b.frame = CGRectMake(8, 8, 34, 34);
-    b.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
-    b.layer.cornerRadius = 17;
-    b.tintColor = UIColor.whiteColor;
-    [b setImage:[UIImage systemImageNamed:@"arrow.down.circle"] forState:UIControlStateNormal];
-    [b addTarget:YTDLTarget.class action:@selector(tapped) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:b];
+    EnsureWindow();
 }
 
 static BOOL Install(void) {
