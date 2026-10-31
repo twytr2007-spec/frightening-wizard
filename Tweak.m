@@ -1,19 +1,18 @@
-// YTDownload - standalone dylib (no Substrate). Uses plain ObjC runtime swizzling.
+// YTDownload - standalone dylib (no Substrate). Plain ObjC runtime swizzling.
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-static NSString *const kUA = @"com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1 like Mac OS X;)";
-static NSString *const kClientVer = @"19.45.4";
-
 static __weak UIViewController *gPlayerVC;
 static UIAlertController *gProgress;
+static BOOL gProgressReady;
+static BOOL gCancel;
+static NSString *gLastErr;
+static UIBackgroundTaskIdentifier gBG = UIBackgroundTaskInvalid;
 
-#pragma mark - UI helpers
+#pragma mark - Overlay window (button + all alerts live here)
 
-// Dedicated overlay window: hosts the button above everything and presents all alerts,
-// so YouTube's own view/gesture hierarchy can't swallow touches or block presentation.
 @interface YTDLWindow : UIWindow
 @end
 @implementation YTDLWindow
@@ -47,7 +46,7 @@ static void UpdateButton(void) {
     CGRect wb = gWin.bounds;
     CGFloat x = MAX(r.origin.x, 0) + 8;
     CGFloat y = MAX(r.origin.y, 0) + 8;
-    if (wb.size.width > wb.size.height) { // landscape: keep clear of notch/status area
+    if (wb.size.width > wb.size.height) {
         x += gWin.safeAreaInsets.left;
         y += 8;
     }
@@ -88,19 +87,31 @@ static UIViewController *TopVC(void) {
     return v;
 }
 
+#pragma mark - Alerts
+
 static void ShowMsg(NSString *title, NSString *msg) {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIAlertController *a = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [a addAction:[UIAlertAction actionWithTitle:@"نسخ" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+            UIPasteboard.generalPasteboard.string = msg ?: @"";
+        }]];
+        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
         [TopVC() presentViewController:a animated:YES completion:nil];
     });
 }
 
 static void SetProgress(NSString *text) {
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (gCancel) return;
         if (!gProgress) {
-            gProgress = [UIAlertController alertControllerWithTitle:@"التنزيل" message:text preferredStyle:UIAlertControllerStyleAlert];
-            [TopVC() presentViewController:gProgress animated:YES completion:nil];
+            gProgressReady = NO;
+            UIAlertController *a = [UIAlertController alertControllerWithTitle:@"التنزيل" message:text preferredStyle:UIAlertControllerStyleAlert];
+            [a addAction:[UIAlertAction actionWithTitle:@"إلغاء" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
+                gCancel = YES;
+                gProgress = nil;
+            }]];
+            gProgress = a;
+            [TopVC() presentViewController:a animated:YES completion:^{ gProgressReady = YES; }];
         } else {
             gProgress.message = text;
         }
@@ -110,10 +121,55 @@ static void SetProgress(NSString *text) {
 static void HideProgress(void (^after)(void)) {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIAlertController *p = gProgress;
+        if (!p) { if (after) after(); return; }
+        if (!gProgressReady) { // still animating in; wait a moment
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                HideProgress(after);
+            });
+            return;
+        }
         gProgress = nil;
-        if (p) [p dismissViewControllerAnimated:YES completion:after];
-        else if (after) after();
+        [p dismissViewControllerAnimated:YES completion:after];
     });
+}
+
+static void EndBG(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (gBG != UIBackgroundTaskInvalid) {
+            [UIApplication.sharedApplication endBackgroundTask:gBG];
+            gBG = UIBackgroundTaskInvalid;
+        }
+    });
+}
+
+static void Fail(NSString *msg) {
+    EndBG();
+    if (gCancel) { HideProgress(nil); return; }
+    HideProgress(^{ ShowMsg(@"فشل", msg); });
+}
+
+#pragma mark - Clients
+
+static NSArray<NSDictionary *> *Clients(void) {
+    static NSArray *c;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *vrUA = @"com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
+        NSString *iosUA = @"com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1 like Mac OS X;)";
+        c = @[
+            @{@"name": @"ANDROID_VR", @"id": @"28", @"ver": @"1.60.19", @"ua": vrUA,
+              @"ctx": @{@"clientName": @"ANDROID_VR", @"clientVersion": @"1.60.19",
+                        @"deviceMake": @"Oculus", @"deviceModel": @"Quest 3",
+                        @"osName": @"Android", @"osVersion": @"12L", @"androidSdkVersion": @32,
+                        @"userAgent": vrUA, @"hl": @"en", @"gl": @"US"}},
+            @{@"name": @"IOS", @"id": @"5", @"ver": @"19.45.4", @"ua": iosUA,
+              @"ctx": @{@"clientName": @"IOS", @"clientVersion": @"19.45.4",
+                        @"deviceMake": @"Apple", @"deviceModel": @"iPhone16,2",
+                        @"osName": @"iPhone", @"osVersion": @"18.1.0.22B83",
+                        @"userAgent": iosUA, @"hl": @"en", @"gl": @"US"}}
+        ];
+    });
+    return c;
 }
 
 #pragma mark - Networking
@@ -128,67 +184,104 @@ static long long SizeOf(NSDictionary *f, NSString *url) {
     return 0;
 }
 
-static void FetchStreams(NSString *vid, void (^cb)(NSDictionary *sd, NSString *err)) {
+static BOOL HasUsableURLs(NSDictionary *sd) {
+    for (NSString *k in @[@"adaptiveFormats", @"formats"]) {
+        for (NSDictionary *f in sd[k]) {
+            if ([f[@"url"] length]) return YES;
+        }
+    }
+    return NO;
+}
+
+static void TryClient(NSString *vid, NSUInteger idx, NSMutableArray *errs,
+                      void (^cb)(NSDictionary *sd, NSDictionary *client, NSString *err)) {
+    NSArray *clients = Clients();
+    if (idx >= clients.count) { cb(nil, nil, [errs componentsJoinedByString:@"\n"]); return; }
+    if (gCancel) { cb(nil, nil, @"cancelled"); return; }
+    NSDictionary *cl = clients[idx];
+
     NSURL *u = [NSURL URLWithString:@"https://youtubei.googleapis.com/youtubei/v1/player?prettyPrint=false"];
     NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:u];
     r.HTTPMethod = @"POST";
+    r.timeoutInterval = 25;
     [r setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    [r setValue:kUA forHTTPHeaderField:@"User-Agent"];
-    [r setValue:@"5" forHTTPHeaderField:@"X-YouTube-Client-Name"];
-    [r setValue:kClientVer forHTTPHeaderField:@"X-YouTube-Client-Version"];
+    [r setValue:cl[@"ua"] forHTTPHeaderField:@"User-Agent"];
+    [r setValue:cl[@"id"] forHTTPHeaderField:@"X-YouTube-Client-Name"];
+    [r setValue:cl[@"ver"] forHTTPHeaderField:@"X-YouTube-Client-Version"];
     NSDictionary *body = @{
         @"videoId": vid,
         @"contentCheckOk": @YES,
         @"racyCheckOk": @YES,
-        @"context": @{@"client": @{
-            @"clientName": @"IOS",
-            @"clientVersion": kClientVer,
-            @"deviceMake": @"Apple",
-            @"deviceModel": @"iPhone16,2",
-            @"osName": @"iPhone",
-            @"osVersion": @"18.1.0.22B83",
-            @"hl": @"en",
-            @"gl": @"US"
-        }}
+        @"playbackContext": @{@"contentPlaybackContext": @{@"html5Preference": @"HTML5_PREF_WANTS"}},
+        @"context": @{@"client": cl[@"ctx"]}
     };
     r.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+
     [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
-        if (e || !d) { cb(nil, e.localizedDescription ?: @"no data"); return; }
-        NSDictionary *j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
-        NSDictionary *sd = j[@"streamingData"];
-        if (![sd isKindOfClass:NSDictionary.class]) {
-            NSString *reason = j[@"playabilityStatus"][@"reason"] ?: @"لم يتم العثور على روابط البث";
-            cb(nil, reason);
+        NSInteger code = [(NSHTTPURLResponse *)resp statusCode];
+        NSDictionary *j = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+        NSDictionary *sd = [j isKindOfClass:NSDictionary.class] ? j[@"streamingData"] : nil;
+        if ([sd isKindOfClass:NSDictionary.class] && HasUsableURLs(sd)) {
+            cb(sd, cl, nil);
             return;
         }
-        cb(sd, nil);
+        NSString *status = j[@"playabilityStatus"][@"status"];
+        NSString *reason = j[@"playabilityStatus"][@"reason"];
+        NSString *apiErr = j[@"error"][@"message"];
+        NSString *line = [NSString stringWithFormat:@"%@: HTTP %ld %@ %@ %@ %@", cl[@"name"], (long)code,
+                          status ?: @"", reason ?: @"", apiErr ?: @"", e.localizedDescription ?: @""];
+        if ([sd isKindOfClass:NSDictionary.class]) line = [line stringByAppendingString:@" (no direct URLs)"];
+        [errs addObject:line];
+        TryClient(vid, idx + 1, errs, cb);
     }] resume];
 }
 
-static void FetchChunk(NSURL *url, NSFileHandle *fh, long long off, long long total,
+static void FetchStreams(NSString *vid, void (^cb)(NSDictionary *sd, NSDictionary *client, NSString *err)) {
+    TryClient(vid, 0, [NSMutableArray array], cb);
+}
+
+static void FetchChunk(NSURL *url, NSString *ua, NSFileHandle *fh, long long off, long long total,
                        void (^prog)(long long), void (^done)(BOOL)) {
+    if (gCancel) { done(NO); return; }
     if (off >= total) { done(YES); return; }
     long long end = MIN(off + 9999999LL, total - 1);
     NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:url];
+    r.timeoutInterval = 30;
     [r setValue:[NSString stringWithFormat:@"bytes=%lld-%lld", off, end] forHTTPHeaderField:@"Range"];
-    [r setValue:kUA forHTTPHeaderField:@"User-Agent"];
-    [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
-        NSInteger code = [(NSHTTPURLResponse *)resp statusCode];
-        if (e || !d.length || (code != 200 && code != 206)) { done(NO); return; }
-        [fh writeData:d];
-        prog(off + (long long)d.length);
-        if (code == 200) { done(YES); return; } // server ignored Range, whole file received
-        FetchChunk(url, fh, off + (long long)d.length, total, prog, done);
-    }] resume];
+    [r setValue:ua forHTTPHeaderField:@"User-Agent"];
+    __block int attempt = 0;
+    __block void (^go)(void);
+    go = ^{
+        [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
+            NSInteger code = [(NSHTTPURLResponse *)resp statusCode];
+            BOOL good = !e && d.length && (code == 200 || code == 206);
+            if (!good) {
+                if (attempt++ < 2 && !gCancel && code != 403) { // retry transient errors
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), go);
+                    return;
+                }
+                gLastErr = [NSString stringWithFormat:@"HTTP %ld %@", (long)code, e.localizedDescription ?: @""];
+                go = nil;
+                done(NO);
+                return;
+            }
+            [fh writeData:d];
+            prog(off + (long long)d.length);
+            go = nil;
+            if (code == 200) { done(YES); return; } // server ignored Range: whole file received
+            FetchChunk(url, ua, fh, off + (long long)d.length, total, prog, done);
+        }] resume];
+    };
+    go();
 }
 
-static void DownloadFile(NSString *urlStr, long long total, NSString *path,
+static void DownloadFile(NSString *urlStr, NSString *ua, long long total, NSString *path,
                          void (^prog)(long long), void (^done)(BOOL)) {
-    if (total <= 0) { done(NO); return; }
+    if (total <= 0) { gLastErr = @"حجم الملف غير معروف"; done(NO); return; }
     [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
     [[NSFileManager defaultManager] createFileAtPath:path contents:nil attributes:nil];
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-    FetchChunk([NSURL URLWithString:urlStr], fh, 0, total, prog, ^(BOOL ok) {
+    FetchChunk([NSURL URLWithString:urlStr], ua, fh, 0, total, prog, ^(BOOL ok) {
         [fh closeFile];
         done(ok);
     });
@@ -201,7 +294,7 @@ static void MergeAV(NSString *vp, NSString *ap, NSString *out, void (^done)(BOOL
     AVURLAsset *a = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:ap] options:nil];
     AVAssetTrack *vt = [v tracksWithMediaType:AVMediaTypeVideo].firstObject;
     AVAssetTrack *at = [a tracksWithMediaType:AVMediaTypeAudio].firstObject;
-    if (!vt || !at) { done(NO); return; }
+    if (!vt || !at) { gLastErr = @"لم أجد مسار الفيديو/الصوت"; done(NO); return; }
     CMTime dur = CMTimeMinimum(v.duration, a.duration);
     AVMutableComposition *c = [AVMutableComposition composition];
     NSError *err = nil;
@@ -209,18 +302,21 @@ static void MergeAV(NSString *vp, NSString *ap, NSString *out, void (^done)(BOOL
     [cv insertTimeRange:CMTimeRangeMake(kCMTimeZero, dur) ofTrack:vt atTime:kCMTimeZero error:&err];
     AVMutableCompositionTrack *ca = [c addMutableTrackWithMediaType:AVMediaTypeAudio preferredTrackID:kCMPersistentTrackID_Invalid];
     [ca insertTimeRange:CMTimeRangeMake(kCMTimeZero, dur) ofTrack:at atTime:kCMTimeZero error:&err];
-    if (err) { done(NO); return; }
+    if (err) { gLastErr = err.localizedDescription; done(NO); return; }
     cv.preferredTransform = vt.preferredTransform;
     [[NSFileManager defaultManager] removeItemAtPath:out error:nil];
     AVAssetExportSession *ex = [[AVAssetExportSession alloc] initWithAsset:c presetName:AVAssetExportPresetPassthrough];
+    if (!ex) { gLastErr = @"تعذّر إنشاء جلسة التصدير"; done(NO); return; }
     ex.outputURL = [NSURL fileURLWithPath:out];
     ex.outputFileType = AVFileTypeMPEG4;
     [ex exportAsynchronouslyWithCompletionHandler:^{
+        if (ex.status != AVAssetExportSessionStatusCompleted) gLastErr = ex.error.localizedDescription;
         done(ex.status == AVAssetExportSessionStatusCompleted);
     }];
 }
 
 static void Finish(NSString *path) {
+    EndBG();
     HideProgress(^{
         UIActivityViewController *s = [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:path]] applicationActivities:nil];
         UIViewController *top = TopVC();
@@ -230,34 +326,50 @@ static void Finish(NSString *path) {
     });
 }
 
-static void Fail(NSString *msg) {
-    HideProgress(^{ ShowMsg(@"فشل", msg); });
+static void CleanTemp(void) {
+    NSString *tmp = NSTemporaryDirectory();
+    for (NSString *f in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:tmp error:nil]) {
+        if ([f hasPrefix:@"yt_"]) [[NSFileManager defaultManager] removeItemAtPath:[tmp stringByAppendingPathComponent:f] error:nil];
+    }
 }
 
 static void StartDownload(NSDictionary *opt, NSString *vid) {
+    gCancel = NO;
+    CleanTemp();
+    dispatch_async(dispatch_get_main_queue(), ^{
+        gBG = [UIApplication.sharedApplication beginBackgroundTaskWithExpirationHandler:^{
+            gCancel = YES;
+            if (gBG != UIBackgroundTaskInvalid) { [UIApplication.sharedApplication endBackgroundTask:gBG]; gBG = UIBackgroundTaskInvalid; }
+        }];
+    });
+
     NSString *tmp = NSTemporaryDirectory();
+    NSString *ext = opt[@"ext"] ?: @"mp4";
+    NSString *ua = opt[@"ua"];
+    NSString *out = [tmp stringByAppendingPathComponent:[NSString stringWithFormat:@"yt_%@_%@.%@", vid, opt[@"tag"], ext]];
     NSString *vp = [tmp stringByAppendingPathComponent:[NSString stringWithFormat:@"yt_%@_v.mp4", vid]];
     NSString *ap = [tmp stringByAppendingPathComponent:[NSString stringWithFormat:@"yt_%@_a.m4a", vid]];
-    NSString *out = [tmp stringByAppendingPathComponent:[NSString stringWithFormat:@"yt_%@_%@.mp4", vid, opt[@"height"]]];
     NSDictionary *v = opt[@"video"], *a = opt[@"audio"];
     long long vt = [v[@"size"] longLongValue];
     long long at = [a[@"size"] longLongValue];
+    NSString *firstPath = a ? vp : out;
 
-    SetProgress(@"جاري تنزيل الفيديو… 0%");
-    DownloadFile(v[@"url"], vt, vp, ^(long long n) {
-        SetProgress([NSString stringWithFormat:@"جاري تنزيل الفيديو… %lld%%", n * 100 / MAX(vt, 1)]);
+    SetProgress(@"جاري التنزيل… 0%");
+    DownloadFile(v[@"url"], ua, vt, firstPath, ^(long long n) {
+        SetProgress([NSString stringWithFormat:@"جاري تنزيل %@… %lld%%", a ? @"الفيديو" : @"الملف", n * 100 / MAX(vt, 1)]);
     }, ^(BOOL ok) {
-        if (!ok) { Fail(@"تعذّر تنزيل الفيديو. قد تكون الروابط انتهت أو تغيّرت."); return; }
-        if (!a) { Finish(vp); return; }
-        DownloadFile(a[@"url"], at, ap, ^(long long n) {
+        if (!ok) { Fail([NSString stringWithFormat:@"تعذّر التنزيل.\n%@", gLastErr ?: @""]); return; }
+        if (!a) { Finish(out); return; }
+        DownloadFile(a[@"url"], ua, at, ap, ^(long long n) {
             SetProgress([NSString stringWithFormat:@"جاري تنزيل الصوت… %lld%%", n * 100 / MAX(at, 1)]);
         }, ^(BOOL ok2) {
-            if (!ok2) { Fail(@"تعذّر تنزيل الصوت."); return; }
+            if (!ok2) { Fail([NSString stringWithFormat:@"تعذّر تنزيل الصوت.\n%@", gLastErr ?: @""]); return; }
             SetProgress(@"جاري دمج الصوت والفيديو…");
             MergeAV(vp, ap, out, ^(BOOL ok3) {
                 [[NSFileManager defaultManager] removeItemAtPath:vp error:nil];
                 [[NSFileManager defaultManager] removeItemAtPath:ap error:nil];
-                if (ok3) Finish(out); else Fail(@"فشل دمج الصوت والفيديو.");
+                if (ok3) Finish(out);
+                else Fail([NSString stringWithFormat:@"فشل دمج الصوت والفيديو.\n%@", gLastErr ?: @""]);
             });
         });
     });
@@ -265,8 +377,9 @@ static void StartDownload(NSDictionary *opt, NSString *vid) {
 
 #pragma mark - Options
 
-static NSArray *BuildOptions(NSDictionary *sd) {
-    NSMutableDictionary *bestAudio = nil;
+static NSArray *BuildOptions(NSDictionary *sd, NSDictionary *client) {
+    NSString *ua = client[@"ua"];
+    NSDictionary *bestAudio = nil;
     NSMutableDictionary<NSNumber *, NSDictionary *> *byHeight = [NSMutableDictionary dictionary];
 
     for (NSDictionary *f in sd[@"adaptiveFormats"]) {
@@ -276,8 +389,7 @@ static NSArray *BuildOptions(NSDictionary *sd) {
         if (size <= 0) continue;
         NSDictionary *item = @{@"url": url, @"size": @(size), @"bitrate": f[@"bitrate"] ?: @0};
         if ([mime hasPrefix:@"audio/mp4"]) {
-            if (!bestAudio || [item[@"bitrate"] longLongValue] > [bestAudio[@"bitrate"] longLongValue])
-                bestAudio = [item mutableCopy];
+            if (!bestAudio || [item[@"bitrate"] longLongValue] > [bestAudio[@"bitrate"] longLongValue]) bestAudio = item;
         } else if ([mime hasPrefix:@"video/mp4"] && [mime containsString:@"avc1"]) {
             NSNumber *h = f[@"height"];
             if (!h) continue;
@@ -295,18 +407,24 @@ static NSArray *BuildOptions(NSDictionary *sd) {
             NSDictionary *v = byHeight[h];
             double mb = ([v[@"size"] longLongValue] + [bestAudio[@"size"] longLongValue]) / 1048576.0;
             [opts addObject:@{@"label": [NSString stringWithFormat:@"%@p  (%.0f MB)", h, mb],
-                              @"height": h, @"video": v, @"audio": bestAudio}];
+                              @"tag": [NSString stringWithFormat:@"%@p", h], @"ext": @"mp4",
+                              @"video": v, @"audio": bestAudio, @"ua": ua}];
         }
     }
-    // Muxed formats (video+audio in one file), usually 360p/720p
+    // Muxed (video+audio in one file)
     for (NSDictionary *f in sd[@"formats"]) {
         NSString *mime = f[@"mimeType"], *url = f[@"url"];
         NSNumber *h = f[@"height"];
-        if (!url.length || ![mime hasPrefix:@"video/mp4"] || !h || byHeight[h]) continue;
+        if (!url.length || ![mime hasPrefix:@"video/mp4"] || !h || (bestAudio && byHeight[h])) continue;
         long long size = SizeOf(f, url);
         if (size <= 0) continue;
         [opts addObject:@{@"label": [NSString stringWithFormat:@"%@p  (%.0f MB)", h, size / 1048576.0],
-                          @"height": h, @"video": @{@"url": url, @"size": @(size)}}];
+                          @"tag": [NSString stringWithFormat:@"%@p", h], @"ext": @"mp4",
+                          @"video": @{@"url": url, @"size": @(size)}, @"ua": ua}];
+    }
+    if (bestAudio) {
+        [opts addObject:@{@"label": [NSString stringWithFormat:@"🎵 صوت فقط  (%.0f MB)", [bestAudio[@"size"] longLongValue] / 1048576.0],
+                          @"tag": @"audio", @"ext": @"m4a", @"video": bestAudio, @"ua": ua}];
     }
     return opts;
 }
@@ -329,7 +447,7 @@ static void ShowQualityPicker(NSArray *opts, NSString *vid) {
     });
 }
 
-#pragma mark - Button
+#pragma mark - Button action
 
 @interface YTDLTarget : NSObject
 - (void)tapped;
@@ -337,6 +455,8 @@ static void ShowQualityPicker(NSArray *opts, NSString *vid) {
 
 @implementation YTDLTarget
 - (void)tapped {
+    if (gProgress) return; // a download is already running
+    gCancel = NO;
     NSString *vid = nil;
     UIViewController *vc = gPlayerVC;
     SEL sel = NSSelectorFromString(@"currentVideoID");
@@ -348,10 +468,10 @@ static void ShowQualityPicker(NSArray *opts, NSString *vid) {
         return;
     }
     SetProgress(@"جاري جلب الجودات المتاحة…");
-    FetchStreams(vid, ^(NSDictionary *sd, NSString *err) {
-        if (!sd) { Fail(err); return; }
-        NSArray *opts = BuildOptions(sd);
-        if (!opts.count) { Fail(@"ما لقيت جودات قابلة للتنزيل لهذا الفيديو."); return; }
+    FetchStreams(vid, ^(NSDictionary *sd, NSDictionary *client, NSString *err) {
+        if (!sd) { Fail([NSString stringWithFormat:@"ما لقيت روابط بث.\n\n%@", err ?: @""]); return; }
+        NSArray *opts = BuildOptions(sd, client);
+        if (!opts.count) { Fail(@"ما لقيت جودات قابلة للتنزيل (غالبًا الصيغ غير مدعومة)."); return; }
         HideProgress(^{ ShowQualityPicker(opts, vid); });
     });
 }
@@ -375,7 +495,7 @@ static BOOL Install(void) {
     if (!m) return NO;
     IMP inherited = method_getImplementation(m);
     if (class_addMethod(c, sel, (IMP)newAppear, method_getTypeEncoding(m))) {
-        origAppear = (void *)inherited;       // class had no own implementation
+        origAppear = (void *)inherited;
     } else {
         origAppear = (void *)method_setImplementation(class_getInstanceMethod(c, sel), (IMP)newAppear);
     }
