@@ -9,7 +9,7 @@ static UIAlertController *gProgress;
 static BOOL gProgressReady;
 static BOOL gCancel;
 static NSString *gLastErr;
-static UIBackgroundTaskIdentifier gBG = UIBackgroundTaskInvalid;
+static UIBackgroundTaskIdentifier gBG = 0; // 0 == UIBackgroundTaskInvalid
 
 #pragma mark - Overlay window (button + all alerts live here)
 
